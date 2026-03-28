@@ -485,19 +485,19 @@ def evaluar_señal(up_m, dn_m):
 
     if signal_up["combined"] >= OBI_STRONG_THRESHOLD:
         if PRECIO_MIN_LADO1 <= mid_up <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "DOWN"
+            return signal_up, signal_dn, "UP"
 
     if signal_dn["combined"] >= OBI_STRONG_THRESHOLD:
         if PRECIO_MIN_LADO1 <= mid_dn <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "UP"
+            return signal_up, signal_dn, "DOWN"
 
     if signal_up["label"] in ("UP", "STRONG UP") and signal_up["combined"] > signal_dn["combined"]:
         if PRECIO_MIN_LADO1 <= mid_up <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "DOWN"
+            return signal_up, signal_dn, "UP"
 
     if signal_dn["label"] in ("UP", "STRONG UP") and signal_dn["combined"] > signal_up["combined"]:
         if PRECIO_MIN_LADO1 <= mid_dn <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "UP"
+            return signal_up, signal_dn, "DOWN"
 
     return signal_up, signal_dn, None
 
@@ -560,7 +560,7 @@ def intentar_hedge(up_m, dn_m, mkt):
         return
 
     obi_lado2 = m_lado2["obi"]
-    if obi_lado2 > -HEDGE_OBI_MIN:
+    if obi_lado2 < HEDGE_OBI_MIN:
         return
 
     ask_lado2 = m_lado2["best_ask"]
