@@ -513,7 +513,7 @@ def intentar_hedge(up_m, dn_m, mkt):
         return
 
     obi_lado2 = m_lado2["obi"]
-    if obi_lado2 < HEDGE_OBI_MIN:
+    if obi_lado2 > -HEDGE_OBI_MIN:
         return
 
     ask_lado2 = m_lado2["best_ask"]
