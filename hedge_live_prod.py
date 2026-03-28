@@ -430,7 +430,7 @@ def forzar_salida(
 def comprar_sim(lado: str, mkt: dict) -> tuple[float, float, float]:
     """Simula una compra: espera 0.5s (lag de entrada) y usa el precio ask real en ese momento."""
     import asyncio, threading
-    time.sleep(0.5)  # lag de entrada simulado
+    time.sleep(1.0)  # lag de entrada simulado
 
     token_id = mkt["up_token_id"] if lado == "UP" else mkt["down_token_id"]
     ob, _    = get_order_book_metrics(token_id)
