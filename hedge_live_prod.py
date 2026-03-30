@@ -1,23 +1,13 @@
 """
-hedge_live_prod.py — Hedge Dinámico BTC Up/Down 5m  *** PRODUCCIÓN REAL ***
+basket_soft.py — Divergencia Armónica ETH/SOL/BTC  [SOFT]
 
-Estrategia idéntica a hedge_live.py (SIM-V3 v9) pero con órdenes reales en Polymarket CLOB.
+Idéntico a basket.py v5 con 3 diferencias:
+  1. CONSENSUS_SOFT = 0.55  (era 0.80) — basta con que 1 par esté > 0.55
+  2. Entra con consenso SOFT  (basket normal solo acepta FULL)
+  3. Sin DIVERGENCE_MAX      (acepta gaps de cualquier tamaño >= threshold)
 
-Diferencias vs simulación:
-  - comprar()       → place_taker_buy()  al ask real
-  - forzar_salida() → approve_conditional_token() + place_taker_sell() al bid real
-  - resolución      → vende lado ganador al bid (cerca de 1.0) antes de redención
-  - capital inicial → sincronizado desde get_usdc_balance() al arrancar
-
-Variables de entorno requeridas:
-  POLYMARKET_KEY   — clave privada hex de la wallet
-  PROXY_ADDRESS    — dirección proxy en Polymarket
-  POLY_CHAIN_ID    — 137 (default)
-  CAPITAL_INICIAL  — capital de referencia (solo para ROI / drawdown tracking)
-  STATE_FILE       — path archivo estado  (default: /app/data/state.json)
-  LOG_FILE         — path archivo log     (default: /app/data/hedge_log.json)
-  EVENTS_FILE      — path eventos         (default: /app/data/events.log)
-  PORT             — puerto HTTP          (default: 8080)
+Todo lo demás igual: misma detección armónica, mismo lado de entrada (el barato),
+mismo stop loss, misma resolución CLOB.
 """
 
 import asyncio
@@ -25,1109 +15,812 @@ import os
 import sys
 import time
 import json
+import csv
 import logging
-from datetime import datetime, timezone
+import threading
 from collections import deque
+from datetime import datetime
 
-from strategy_core_prod import (
+from strategy_core import (
     find_active_market,
     get_order_book_metrics,
-    compute_signal,
     seconds_remaining,
-    place_taker_buy,
-    place_taker_sell,
-    approve_conditional_token,
-    get_clob_balance,
-    get_usdc_balance,
 )
 
-# ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     stream=sys.stdout,
 )
-log = logging.getLogger("hedge_prod")
+log = logging.getLogger("basket_soft")
+
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# ─── CONFIG DESDE ENV VARS ────────────────────────────────────────────────────
-CAPITAL_INICIAL = float(os.environ.get("CAPITAL_INICIAL", "100.0"))
-STATE_FILE      = os.environ.get("STATE_FILE",  "/app/data/state.json")
-LOG_FILE        = os.environ.get("LOG_FILE",    "/app/data/hedge_log.json")
-EVENTS_FILE     = os.environ.get("EVENTS_FILE", "/app/data/events.log")
-
-# ─── PARÁMETROS ───────────────────────────────────────────────────────────────
-MONTO_FIJO_POR_LADO  = float(os.environ.get("ENTRY_USD", "3.75"))
+# ═══════════════════════════════════════════════════════
+#  PARÁMETROS
+# ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
-OBI_THRESHOLD        = 0.10
-OBI_WINDOW_SIZE      = 8
-OBI_STRONG_THRESHOLD = 0.20
-SPREAD_MAX           = 0.12
-PRECIO_MIN_LADO1     = 0.35
-PRECIO_MAX_LADO1     = 0.50
-ENTRY_WINDOW_MAX     = 240
-ENTRY_WINDOW_MIN     = 60
-HEDGE_MOVE_MIN       = 0.05
-HEDGE_OBI_MIN        = -0.05
-HEDGE_PRECIO_MIN     = 0.25
-HEDGE_PRECIO_MAX     = 0.35
-EARLY_EXIT_SECS      = 60
-EARLY_EXIT_OBI_FLIP  = -0.15
-EARLY_EXIT_PRICE_DROP = 0.08
-RESOLVED_UP_THRESH   = 0.97
-RESOLVED_DN_THRESH   = 0.03
-MIN_USD_ORDEN        = 1.00
-MIN_HOLD_SECS        = 10
-NEAR_RESOLUTION_THRESH = 0.82
-NEAR_RESOLUTION_SECS   = 90
+DIVERGENCE_THRESHOLD = 0.05    # gap mínimo — igual que basket
+# Sin DIVERGENCE_MAX — acepta cualquier gap >= 5bp
+WAKE_UP_SECS         = 90
+ENTRY_WINDOW_SECS    = 85
+ENTRY_OPEN_SECS      = 60
+ENTRY_CLOSE_SECS     = 30
 
-# ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
-PAUSED    = True
-SIM_MODE  = False
+CAPITAL_TOTAL        = 100.0
+ENTRY_PCT            = 0.01
+ENTRY_USD            = CAPITAL_TOTAL * ENTRY_PCT
 
-estado = {
-    "capital":      CAPITAL_INICIAL,
-    "pnl_total":    0.0,
-    "peak_capital": CAPITAL_INICIAL,
+RESOLVED_UP_THRESH   = 0.98
+RESOLVED_DN_THRESH   = 0.02
+
+CONSENSUS_FULL       = 0.80
+CONSENSUS_SOFT       = 0.55    # ← CAMBIO: era 0.80, ahora 0.55
+
+ENTRY_MIN_PRICE      = 0.65
+
+STOP_LOSS_PRICE      = 0.33
+
+MID_HISTORY_SIZE     = 3
+
+LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_soft_log.json")
+CSV_FILE   = os.environ.get("CSV_FILE",   "/data/basket_soft_trades.csv")
+STATE_FILE = os.environ.get("STATE_FILE", "/data/basket_soft_state.json")
+
+# ═══════════════════════════════════════════════════════
+#  ESTADO DE LOS 3 MERCADOS
+# ═══════════════════════════════════════════════════════
+SYMBOLS = ["ETH", "SOL", "BTC"]
+
+markets = {
+    s: {
+        "info":      None,
+        "up_bid":    0.0, "up_ask": 0.0, "up_mid": 0.0,
+        "dn_bid":    0.0, "dn_ask": 0.0, "dn_mid": 0.0,
+        "time_left": "N/A",
+        "error":     None,
+    }
+    for s in SYMBOLS
+}
+
+mid_history: dict[str, deque] = {
+    s: deque(maxlen=MID_HISTORY_SIZE) for s in SYMBOLS
+}
+
+bt = {
+    "harm_up":      0.0,
+    "harm_dn":      0.0,
+    "signal_asset": None,
+    "signal_side":  None,
+    "signal_div":   0.0,
+    "entry_window": False,
+    "position":     None,
+    "pending_resolution": None,
+    "traded_this_cycle": False,
+    "capital":      CAPITAL_TOTAL,
+    "total_pnl":    0.0,
+    "peak_capital": CAPITAL_TOTAL,
     "max_drawdown": 0.0,
     "wins":         0,
     "losses":       0,
-    "ciclos":       0,
+    "consensus":    "NONE",
+    "skipped":      0,
     "trades":       [],
+    "cycle":        0,
+    "phase":        "DURMIENDO",
+    "next_wake":    "N/A",
 }
 
-obi_history_up = deque(maxlen=OBI_WINDOW_SIZE)
-obi_history_dn = deque(maxlen=OBI_WINDOW_SIZE)
+recent_events = deque(maxlen=50)
 
-pos = {
-    "activa":           False,
-    "lado1_side":       None,
-    "lado1_token_id":   None,   # token_id real para órdenes CLOB
-    "lado1_precio":     0.0,
-    "lado1_shares":     0.0,
-    "lado1_usd":        0.0,
-    "lado2_side":       None,
-    "lado2_token_id":   None,   # token_id real para órdenes CLOB
-    "lado2_precio":     0.0,
-    "lado2_shares":     0.0,
-    "lado2_usd":        0.0,
-    "hedgeado":         False,
-    "capital_usado":    0.0,
-    "ts_entrada":       None,
-    "secs_entrada":     0.0,
-    # ── sistema de reintentos de venta ────────────────────────────────────
-    "salida_pendiente":  False,  # True si hay una venta que no se pudo ejecutar
-    "salida_retries":    0,
-    "salida_tipo":       None,   # "EARLY_EXIT" | "RESOLUTION"
-    "salida_resolucion": None,   # "UP"|"DOWN" — solo para RESOLUTION
-    "salida_razon":      "",     # razon del early exit
-}
-
-eventos      = deque(maxlen=200)
-mkt_end_date = None
-_ob_error_count = 0
+CSV_COLUMNS = [
+    "trade_id", "entry_ts", "exit_ts", "duration_s",
+    "asset", "side", "consensus",
+    "entry_ask", "entry_bid", "entry_mid", "entry_usd", "shares",
+    "secs_left_entry", "harm_entry", "gap_pts",
+    "peer1_sym", "peer1_side_mid", "peer1_opp_mid",
+    "peer2_sym", "peer2_side_mid", "peer2_opp_mid",
+    "sl_price", "exit_type", "exit_price", "resolved", "binary_win",
+    "pnl_usd", "pnl_pct_entry", "max_possible_win", "outcome",
+    "capital_before", "capital_after", "cumulative_pnl", "trade_number",
+]
 
 
-# ─── PERSISTENCIA ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
+#  UTILIDADES
+# ═══════════════════════════════════════════════════════
 
-def _makedirs(filepath):
-    d = os.path.dirname(filepath)
-    if d:
-        os.makedirs(d, exist_ok=True)
+def log_event(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    recent_events.append(entry)
+    log.info(msg)
 
 
-def guardar_estado(up_m=None, dn_m=None):
-    total = estado["wins"] + estado["losses"]
-    wr    = estado["wins"] / total * 100 if total > 0 else 0.0
-    roi   = (estado["capital"] - CAPITAL_INICIAL) / CAPITAL_INICIAL * 100
+def harmonic_mean(values: list) -> float:
+    if not values or any(v <= 0 for v in values):
+        return 0.0
+    return len(values) / sum(1.0 / v for v in values)
 
-    ob_up = {
-        "ask": round(up_m["best_ask"], 4),
-        "bid": round(up_m["best_bid"], 4),
-        "obi": round(up_m["obi"], 4),
-    } if up_m else None
 
-    ob_dn = {
-        "ask": round(dn_m["best_ask"], 4),
-        "bid": round(dn_m["best_bid"], 4),
-        "obi": round(dn_m["obi"], 4),
-    } if dn_m else None
+def find_cheapest(mids: dict, h_avg: float):
+    if h_avg == 0:
+        return None, 0.0
+    cheapest_name, cheapest_diff = None, 0.0
+    for name, mid in mids.items():
+        diff = mid - h_avg
+        if diff < cheapest_diff:
+            cheapest_diff, cheapest_name = diff, name
+    return cheapest_name, cheapest_diff
 
+
+def min_secs_remaining() -> float | None:
+    result = None
+    for sym in SYMBOLS:
+        info = markets[sym]["info"]
+        if info:
+            secs = seconds_remaining(info)
+            if secs is not None:
+                result = secs if result is None else min(result, secs)
+    return result
+
+
+def update_drawdown():
+    cap = bt["capital"]
+    if cap > bt["peak_capital"]:
+        bt["peak_capital"] = cap
+    dd = bt["peak_capital"] - cap
+    if dd > bt["max_drawdown"]:
+        bt["max_drawdown"] = dd
+
+
+# ═══════════════════════════════════════════════════════
+#  RESOLUCIÓN FALLBACK — CLOB
+# ═══════════════════════════════════════════════════════
+
+def resolve_from_clob_history(sym: str) -> str:
+    history = list(mid_history[sym])
+    if not history:
+        log_event(f"FALLBACK {sym}: sin historial CLOB — asumiendo LOSS")
+        return "_UNKNOWN"
+
+    avg = sum(history) / len(history)
+    log_event(
+        f"FALLBACK {sym}: up_mid_avg={avg:.4f} "
+        f"(últimas {len(history)} muestras: {[round(v,4) for v in history]})"
+    )
+
+    if avg > 0.5:
+        return "UP"
+    elif avg < 0.5:
+        return "DOWN"
+    else:
+        log_event(f"FALLBACK {sym}: empate técnico (avg=0.5) — asumiendo LOSS conservador")
+        return "_UNKNOWN"
+
+
+# ═══════════════════════════════════════════════════════
+#  ESCRITURA DE ESTADO PARA DASHBOARD
+# ═══════════════════════════════════════════════════════
+
+def write_state():
+    total_trades = bt["wins"] + bt["losses"]
+    win_rate = (bt["wins"] / total_trades * 100) if total_trades > 0 else 0.0
+    roi = (bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100
+
+    state = {
+        "ts": datetime.now().isoformat(),
+        "phase": bt["phase"],
+        "cycle": bt["cycle"],
+        "capital": round(bt["capital"], 4),
+        "total_pnl": round(bt["total_pnl"], 4),
+        "roi": round(roi, 2),
+        "peak_capital": round(bt["peak_capital"], 4),
+        "max_drawdown": round(bt["max_drawdown"], 4),
+        "wins": bt["wins"],
+        "losses": bt["losses"],
+        "win_rate": round(win_rate, 1),
+        "skipped": bt["skipped"],
+        "consensus": bt["consensus"],
+        "entry_window": bt["entry_window"],
+        "next_wake": bt["next_wake"],
+        "harm_up": round(bt["harm_up"], 4),
+        "harm_dn": round(bt["harm_dn"], 4),
+        "signal_asset": bt["signal_asset"],
+        "signal_side": bt["signal_side"],
+        "signal_div": round(bt["signal_div"], 4),
+        "position": bt["position"],
+        "pending_resolution": None,
+        "markets": {
+            sym: {
+                "up_mid": round(markets[sym]["up_mid"], 4),
+                "dn_mid": round(markets[sym]["dn_mid"], 4),
+                "up_ask": round(markets[sym]["up_ask"], 4),
+                "dn_ask": round(markets[sym]["dn_ask"], 4),
+                "time_left": markets[sym]["time_left"],
+                "error": markets[sym]["error"],
+            }
+            for sym in SYMBOLS
+        },
+        "events": list(recent_events)[-30:],
+        "recent_trades": bt["trades"][-10:],
+    }
     try:
-        _makedirs(STATE_FILE)
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({
-                "ts":              datetime.now().isoformat(),
-                "capital":         round(estado["capital"], 4),
-                "capital_inicial": CAPITAL_INICIAL,
-                "pnl_total":       round(estado["pnl_total"], 4),
-                "roi":             round(roi, 2),
-                "peak_capital":    round(estado["peak_capital"], 4),
-                "max_drawdown":    round(estado["max_drawdown"], 4),
-                "wins":            estado["wins"],
-                "losses":          estado["losses"],
-                "win_rate":        round(wr, 1),
-                "ciclos":          estado["ciclos"],
-                "ob_up":           ob_up,
-                "ob_dn":           ob_dn,
-                "paused":          PAUSED,
-                "sim_mode":        SIM_MODE,
-                "posicion": {
-                    "activa":        pos["activa"],
-                    "lado1":         pos["lado1_side"],
-                    "lado2":         pos["lado2_side"],
-                    "hedgeado":      pos["hedgeado"],
-                    "capital_usado": round(pos["capital_usado"], 4),
-                },
-                "mkt_end_date": mkt_end_date,
-                "eventos": list(eventos)[-30:],
-                "trades":  estado["trades"][-20:],
-            }, f, indent=2)
-        os.replace(tmp, STATE_FILE)
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
     except Exception as e:
-        log.warning(f"guardar_estado error: {e}")
-
-    try:
-        _makedirs(LOG_FILE)
-        with open(LOG_FILE, "w") as f:
-            json.dump({
-                "summary": {
-                    "capital_inicial": CAPITAL_INICIAL,
-                    "capital_actual":  round(estado["capital"], 4),
-                    "pnl_total":       round(estado["pnl_total"], 4),
-                    "roi_pct":         round(roi, 2),
-                    "max_drawdown":    round(estado["max_drawdown"], 4),
-                    "wins":            estado["wins"],
-                    "losses":          estado["losses"],
-                    "win_rate":        round(wr, 1),
-                },
-                "trades": estado["trades"],
-            }, f, indent=2)
-    except Exception as e:
-        log.warning(f"guardar_log error: {e}")
+        log.warning(f"write_state error: {e}")
 
 
-def restaurar_estado():
-    if not os.path.isfile(LOG_FILE):
-        log.info("Sin estado previo — iniciando desde cero.")
+# ═══════════════════════════════════════════════════════
+#  RESTAURAR ESTADO DESDE CSV
+# ═══════════════════════════════════════════════════════
+
+def restore_state_from_csv():
+    if not os.path.isfile(CSV_FILE):
+        log.info("No hay CSV previo — iniciando desde cero.")
         return
     try:
-        with open(LOG_FILE) as f:
-            data = json.load(f)
-        s = data.get("summary", {})
-        estado["capital"]   = float(s.get("capital_actual", CAPITAL_INICIAL))
-        estado["pnl_total"] = float(s.get("pnl_total", 0.0))
-        estado["wins"]      = int(s.get("wins", 0))
-        estado["losses"]    = int(s.get("losses", 0))
-        estado["trades"]    = data.get("trades", [])
-
-        peak = CAPITAL_INICIAL
-        for t in estado["trades"]:
-            cap = float(t.get("capital", CAPITAL_INICIAL))
+        with open(CSV_FILE, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return
+        last = rows[-1]
+        bt["capital"]      = float(last["capital_after"])
+        bt["total_pnl"]    = float(last["cumulative_pnl"])
+        bt["wins"]         = sum(1 for r in rows if r["outcome"] == "WIN")
+        bt["losses"]       = sum(1 for r in rows if r["outcome"] == "LOSS")
+        bt["trades"]       = [dict(r) for r in rows]
+        peak = CAPITAL_TOTAL
+        for r in rows:
+            cap = float(r["capital_after"])
             if cap > peak:
                 peak = cap
             dd = peak - cap
-            if dd > estado["max_drawdown"]:
-                estado["max_drawdown"] = dd
-        estado["peak_capital"] = peak
-
-        total = estado["wins"] + estado["losses"]
-        log.info(
-            f"Estado restaurado — {total} trades | "
-            f"Capital: ${estado['capital']:.2f} | "
-            f"PnL: ${estado['pnl_total']:+.2f} | "
-            f"W:{estado['wins']} L:{estado['losses']}"
-        )
+            if dd > bt["max_drawdown"]:
+                bt["max_drawdown"] = dd
+        bt["peak_capital"] = peak
+        total = bt["wins"] + bt["losses"]
+        log.info(f"Estado restaurado — {total} trades | Capital: ${bt['capital']:.4f} | "
+                 f"PnL: ${bt['total_pnl']:+.4f} | W:{bt['wins']} L:{bt['losses']}")
     except Exception as e:
-        log.warning(f"No se pudo restaurar estado: {e}")
-
-
-def sincronizar_capital_clob():
-    """Sincroniza el capital desde el saldo real USDC del CLOB al arrancar."""
-    try:
-        balance = get_usdc_balance()
-        if balance is not None and balance > 0:
-            log.info(f"Balance CLOB real: ${balance:.2f} USDC")
-            estado["capital"] = balance
-            if balance > estado["peak_capital"]:
-                estado["peak_capital"] = balance
-        else:
-            log.warning("No se pudo obtener balance CLOB — usando capital de estado guardado.")
-    except Exception as e:
-        log.warning(f"sincronizar_capital_clob error: {e}")
-
-
-# ─── UTILIDADES ───────────────────────────────────────────────────────────────
-
-def log_ev(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    entrada = f"[{ts}] {msg}"
-    eventos.append(entrada)
-    log.info(msg)
-    try:
-        _makedirs(EVENTS_FILE)
-        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-            f.write(entrada + "\n")
-    except Exception:
-        pass
-
-
-def mid(m) -> float:
-    b, a = m["best_bid"], m["best_ask"]
-    if b > 0 and a > 0:
-        return round((b + a) / 2, 4)
-    return round(b or a, 4)
-
-
-def actualizar_drawdown():
-    cap = estado["capital"]
-    if cap > estado["peak_capital"]:
-        estado["peak_capital"] = cap
-    dd = estado["peak_capital"] - cap
-    if dd > estado["max_drawdown"]:
-        estado["max_drawdown"] = dd
-
-
-def resetear_pos():
-    for k in pos:
-        if k in ("activa", "hedgeado", "salida_pendiente"):
-            pos[k] = False
-        elif k == "salida_retries":
-            pos[k] = 0
-        elif isinstance(pos[k], str) or pos[k] is None:
-            pos[k] = None
-        else:
-            pos[k] = 0.0
-
-
-def imprimir_estado(up_m, dn_m, secs, signal_up, signal_dn):
-    sep   = "-" * 65
-    total = estado["wins"] + estado["losses"]
-    wr    = estado["wins"] / total * 100 if total > 0 else 0
-    roi   = (estado["capital"] - CAPITAL_INICIAL) / CAPITAL_INICIAL * 100
-
-    print(f"\n{sep}")
-    print(f"  {'[PAUSADO]' if PAUSED else '[ACTIVO] '} "
-          f"Capital: ${estado['capital']:.2f}  PnL: ${estado['pnl_total']:+.2f}  "
-          f"ROI: {roi:+.1f}%  MaxDD: ${estado['max_drawdown']:.2f}")
-    print(f"  W:{estado['wins']} L:{estado['losses']} WR:{wr:.0f}%  |  Ciclos: {estado['ciclos']}")
-    print(f"  Orden fija: ${MONTO_FIJO_POR_LADO:.2f}/lado  [PRODUCCION REAL]")
-
-    if up_m and dn_m:
-        print(f"  UP  bid={up_m['best_bid']:.3f} ask={up_m['best_ask']:.3f} "
-              f"mid={mid(up_m):.3f}  OBI={up_m['obi']:+.3f} spread={up_m['spread']:.3f}")
-        print(f"  DN  bid={dn_m['best_bid']:.3f} ask={dn_m['best_ask']:.3f} "
-              f"mid={mid(dn_m):.3f}  OBI={dn_m['obi']:+.3f} spread={dn_m['spread']:.3f}")
-        if signal_up:
-            print(f"  Señal UP: {signal_up['label']} conf={signal_up['confidence']}%  "
-                  f"combined={signal_up['combined']:+.3f}")
-        if signal_dn:
-            print(f"  Señal DN: {signal_dn['label']} conf={signal_dn['confidence']}%  "
-                  f"combined={signal_dn['combined']:+.3f}")
-        print(f"  Tiempo restante: {int(secs) if secs else '?'}s")
-
-    if pos["activa"]:
-        secs_en_pos = time.time() - pos["ts_entrada"] if pos["ts_entrada"] else 0
-        print(f"\n  POSICION ABIERTA ({int(secs_en_pos)}s):")
-        print(f"    Lado1: {pos['lado1_side']} @ {pos['lado1_precio']:.4f} | "
-              f"${pos['lado1_usd']:.2f} | {pos['lado1_shares']:.4f}sh")
-        if pos["hedgeado"]:
-            print(f"    Lado2: {pos['lado2_side']} @ {pos['lado2_precio']:.4f} | "
-                  f"${pos['lado2_usd']:.2f} | {pos['lado2_shares']:.4f}sh")
-            print(f"    Capital en juego: ${pos['capital_usado']:.2f}")
-        else:
-            print(f"    Esperando hedge...")
-    else:
-        print(f"\n  Sin posicion abierta")
-    print(sep)
-
-
-# ─── COMPRA REAL al ask ────────────────────────────────────────────────────────
-
-def comprar(lado: str, m: dict, token_id: str) -> tuple[float, float, float]:
-    """Coloca una orden de compra real en el CLOB al precio ask."""
-    usd    = MONTO_FIJO_POR_LADO
-    precio = m["best_ask"]
-
-    if usd < MIN_USD_ORDEN:
-        log_ev(f"  Orden muy pequeña: ${usd:.2f}")
-        return 0.0, 0.0, 0.0
-
-    if usd > estado["capital"]:
-        log_ev(f"  Capital insuficiente: ${estado['capital']:.2f} < ${usd:.2f}")
-        return 0.0, 0.0, 0.0
-
-    precio = round(precio + 0.010, 4)  # +1.0¢ para garantizar cruce taker inmediato
-    shares = round(usd / precio, 2)
-
-    result = place_taker_buy(token_id, shares, precio)
-    if not result["success"]:
-        log_ev(f"  ERROR compra {lado}: {result['error']}")
-        return 0.0, 0.0, 0.0
-
-    # Usar shares y precio real de fill
-    shares_filled = result.get("shares_filled") or shares
-    fill_price    = result.get("fill_price") or precio
-    usd_real      = round(shares_filled * fill_price, 4)
-
-    estado["capital"] -= usd_real
-    log_ev(f"  COMPRA REAL {lado} @ {fill_price:.4f} (ask_enviado={precio:.4f}) | {shares_filled:.2f}sh (pedido={shares:.2f}) | ${usd_real:.2f} | orderID={result['orderID']}")
-
-    # Pre-aprobar el token condicional para agilizar la venta posterior (patrón basket_prod)
-    approve_conditional_token(token_id)
-
-    return precio, shares_filled, usd_real
-
-
-# ─── SALIDA REAL ──────────────────────────────────────────────────────────────
-
-def forzar_salida(
-    shares: float,
-    usd_original: float,
-    m: dict,
-    token_id: str,
-    razon: str = "",
-) -> tuple[float, float, bool]:
-    """
-    Vende shares al bid real en el CLOB.
-    Retorna (exit_precio, pnl, success).
-    Si success=False la posición NO debe limpiarse — se reintentará en el próximo ciclo.
-    Usa get_clob_balance para verificar shares reales disponibles (patrón Gold-HARM-ENTRY).
-    """
-    bid         = m["best_bid"]
-    exit_precio = max(round(bid, 4), 0.01)
-
-    # Sincronizar balance del token condicional en el CLOB — hasta 5 intentos
-    clob_balance = 0.0
-    for _intento_bal in range(5):
-        approve_conditional_token(token_id)
-        clob_balance = get_clob_balance(token_id)
-        if clob_balance >= 0.01:
-            break
-        time.sleep(1.0)
-
-    shares_a_vender = round(min(clob_balance * 0.99, shares), 2) if clob_balance >= 0.01 else 0.0
-
-    if shares_a_vender <= 0:
-        log_ev(f"  VENTA diferida — balance CLOB no disponible ({clob_balance:.4f}) | {razon}")
-        return exit_precio, 0.0, False
-
-    result = place_taker_sell(token_id, shares_a_vender, exit_precio)
-    if not result["success"]:
-        log_ev(f"  ERROR venta @ {exit_precio:.4f} | {result['error']} | {razon}")
-        return exit_precio, 0.0, False
-
-    # Usar precio real de fill si está disponible (puede ser mejor que el límite)
-    fill_price = result.get("fill_price") or exit_precio
-    pnl = round(shares_a_vender * fill_price - usd_original, 4)
-    log_ev(f"  VENTA REAL @ {fill_price:.4f} (limite={exit_precio:.4f} bid={bid:.4f}) | {shares_a_vender:.2f}sh | orderID={result['orderID']} | {razon}")
-    return fill_price, pnl, True
-
-
-# ─── COMPRA / SALIDA SIMULADA ─────────────────────────────────────────
-
-def comprar_sim(lado: str, mkt: dict) -> tuple[float, float, float]:
-    """Simula una compra: espera 0.5s (lag de entrada) y usa el precio ask real en ese momento."""
-    import asyncio, threading
-    time.sleep(1.0)  # lag de entrada simulado
-
-    token_id = mkt["up_token_id"] if lado == "UP" else mkt["down_token_id"]
-    ob, _    = get_order_book_metrics(token_id)
-    if not ob:
-        return 0.0, 0.0, 0.0
-
-    precio = round(ob["best_ask"] + 0.010, 4)
-    usd    = MONTO_FIJO_POR_LADO
-
-    if usd > estado["capital"]:
-        log_ev(f"  [SIM] Capital insuficiente: ${estado['capital']:.2f} < ${usd:.2f}")
-        return 0.0, 0.0, 0.0
-
-    shares   = round(usd / precio, 2)
-    usd_real = round(shares * precio, 4)
-
-    estado["capital"] -= usd_real
-    log_ev(f"  [SIM] COMPRA {lado} @ {precio:.4f} (ask+lag) | {shares:.2f}sh | ${usd_real:.2f} | cap=${estado['capital']:.2f}")
-    return precio, shares, usd_real
-
-
-def forzar_salida_sim(
-    shares: float,
-    usd_original: float,
-    m: dict,
-    razon: str = "",
-) -> tuple[float, float, bool]:
-    """Simula una venta al bid actual."""
-    bid        = m["best_bid"]
-    fill_price = round(bid, 4)
-    pnl        = round(shares * fill_price - usd_original, 4)
-    log_ev(f"  [SIM] VENTA @ {fill_price:.4f} (bid) | {shares:.2f}sh | PnL: ${pnl:+.4f} | {razon}")
-    return fill_price, pnl, True
-
-
-# ─── SEÑAL DE ENTRADA ─────────────────────────────────────────────────────────
-
-def evaluar_señal(up_m, dn_m):
-    obi_up = up_m["obi"]
-    obi_dn = dn_m["obi"]
-    obi_history_up.append(obi_up)
-    obi_history_dn.append(obi_dn)
-
-    signal_up = compute_signal(obi_up, list(obi_history_up), OBI_THRESHOLD)
-    signal_dn = compute_signal(obi_dn, list(obi_history_dn), OBI_THRESHOLD)
-
-    if up_m["spread"] > SPREAD_MAX or dn_m["spread"] > SPREAD_MAX:
-        return signal_up, signal_dn, None
-
-    mid_up = mid(up_m)
-    mid_dn = mid(dn_m)
-
-    if signal_up["combined"] >= OBI_STRONG_THRESHOLD:
-        if PRECIO_MIN_LADO1 <= mid_up <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "UP"
-
-    if signal_dn["combined"] >= OBI_STRONG_THRESHOLD:
-        if PRECIO_MIN_LADO1 <= mid_dn <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "DOWN"
-
-    if signal_up["label"] in ("UP", "STRONG UP") and signal_up["combined"] > signal_dn["combined"]:
-        if PRECIO_MIN_LADO1 <= mid_up <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "UP"
-
-    if signal_dn["label"] in ("UP", "STRONG UP") and signal_dn["combined"] > signal_up["combined"]:
-        if PRECIO_MIN_LADO1 <= mid_dn <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "DOWN"
-
-    return signal_up, signal_dn, None
-
-
-# ─── ENTRADA LADO 1 ───────────────────────────────────────────────────────────
-
-def intentar_entrada(up_m, dn_m, mkt, secs) -> bool:
-    if pos["activa"]:
-        return False
-    if secs is None or not (ENTRY_WINDOW_MIN < secs <= ENTRY_WINDOW_MAX):
-        return False
-
-    signal_up, signal_dn, lado = evaluar_señal(up_m, dn_m)
-    if not lado:
-        return False
-
-    m_lado   = up_m if lado == "UP" else dn_m
-    token_id = mkt["up_token_id"] if lado == "UP" else mkt["down_token_id"]
-    obi      = m_lado["obi"]
-
-    log_ev(f"SEÑAL {lado} — OBI={obi:+.3f} | mid={mid(m_lado):.4f} | {int(secs)}s restantes")
-
-    if SIM_MODE:
-        precio, shares, usd = comprar_sim(lado, mkt)
-    else:
-        precio, shares, usd = comprar(lado, m_lado, token_id)
-    if usd == 0.0:
-        return False
-
-    pos["activa"]          = True
-    pos["lado1_side"]      = lado
-    pos["lado1_token_id"]  = token_id
-    pos["lado1_precio"]    = precio
-    pos["lado1_shares"]    = shares
-    pos["lado1_usd"]       = usd
-    pos["capital_usado"]   = usd
-    pos["ts_entrada"]      = time.time()
-    pos["secs_entrada"]    = secs or 0
-
-    log_ev(f"ENTRADA LADO1 {lado} @ {precio:.4f} | {shares:.2f}sh | ${usd:.2f} | cap=${estado['capital']:.2f}")
-    guardar_estado(up_m, dn_m)
-    return True
-
-
-# ─── HEDGE LADO 2 ─────────────────────────────────────────────────────────────
-
-def intentar_hedge(up_m, dn_m, mkt):
-    if not pos["activa"] or pos["hedgeado"]:
-        return
-
-    lado1     = pos["lado1_side"]
-    lado2     = "DOWN" if lado1 == "UP" else "UP"
-    m_lado1   = up_m if lado1 == "UP" else dn_m
-    m_lado2   = dn_m if lado2 == "DOWN" else up_m
-    token_id2 = mkt["down_token_id"] if lado2 == "DOWN" else mkt["up_token_id"]
-    bid_lado1 = m_lado1["best_bid"]
-    subida    = bid_lado1 - pos["lado1_precio"]
-
-    if subida < HEDGE_MOVE_MIN:
-        return
-
-    obi_lado2 = m_lado2["obi"]
-    if obi_lado2 < HEDGE_OBI_MIN:
-        return
-
-    ask_lado2 = m_lado2["best_ask"]
-    if ask_lado2 <= 0 or ask_lado2 < HEDGE_PRECIO_MIN or ask_lado2 > HEDGE_PRECIO_MAX:
-        return
-
-    log_ev(f"  Lado1 subio {subida*100:+.1f}c — hedgeando en {lado2} @ ask={ask_lado2:.4f}")
-
-    if SIM_MODE:
-        precio, shares, usd = comprar_sim(lado2, mkt)
-    else:
-        precio, shares, usd = comprar(lado2, m_lado2, token_id2)
-    if usd == 0.0:
-        return
-
-    pos["lado2_side"]      = lado2
-    pos["lado2_token_id"]  = token_id2
-    pos["lado2_precio"]    = precio
-    pos["lado2_shares"]    = shares
-    pos["lado2_usd"]       = usd
-    pos["hedgeado"]        = True
-    pos["capital_usado"]  += usd
-
-    log_ev(f"HEDGE LADO2 {lado2} @ {precio:.4f} | {shares:.2f}sh | ${usd:.2f} | cap=${estado['capital']:.2f}")
-    guardar_estado(up_m, dn_m)
-
-
-# ─── SALIDA ANTICIPADA ────────────────────────────────────────────────────────
-
-def intentar_early_exit(up_m, dn_m, secs):
-    if not pos["activa"] or pos["hedgeado"]:
-        return
-
-    lado1       = pos["lado1_side"]
-    token_id1   = pos["lado1_token_id"]
-    m_lado1     = up_m if lado1 == "UP" else dn_m
-    bid_lado1   = m_lado1["best_bid"]
-    obi_lado1   = m_lado1["obi"]
-    secs_en_pos = time.time() - pos["ts_entrada"] if pos["ts_entrada"] else 0
-    caida       = pos["lado1_precio"] - bid_lado1
-
-    if secs_en_pos < MIN_HOLD_SECS:
-        return
-
-    if bid_lado1 >= NEAR_RESOLUTION_THRESH and secs is not None and secs <= NEAR_RESOLUTION_SECS:
-        return
-
-    razon = None
-    if secs_en_pos > EARLY_EXIT_SECS:
-        razon = f"timeout {int(secs_en_pos)}s sin hedge"
-    elif obi_lado1 < EARLY_EXIT_OBI_FLIP:
-        razon = f"OBI invertido {obi_lado1:+.3f}"
-    elif caida > EARLY_EXIT_PRICE_DROP:
-        razon = f"caida {caida*100:.1f}c desde entrada"
-
-    if not razon:
-        return
-
-    if SIM_MODE:
-        exit_precio, pnl, ok = forzar_salida_sim(
-            pos["lado1_shares"], pos["lado1_usd"], m_lado1, razon,
-        )
-    else:
-        exit_precio, pnl, ok = forzar_salida(
-            pos["lado1_shares"],
-            pos["lado1_usd"],
-            m_lado1,
-            token_id1,
-            razon,
-        )
-
-    if not ok:
-        # Marcar salida pendiente — se reintentará en el próximo ciclo
-        pos["salida_pendiente"]  = True
-        pos["salida_tipo"]       = "EARLY_EXIT"
-        pos["salida_razon"]      = razon
-        pos["salida_retries"]    = pos.get("salida_retries", 0) + 1
-        log_ev(f"EARLY EXIT pendiente (intento #{pos['salida_retries']}) — reintentando en {POLL_INTERVAL}s")
-        return
-
-    estado["capital"]   += pos["lado1_usd"] + pnl
-    estado["pnl_total"] += pnl
-
-    if pnl >= 0:
-        estado["wins"] += 1
-    else:
-        estado["losses"] += 1
-
-    actualizar_drawdown()
-    log_ev(f"EARLY EXIT {lado1} @ {exit_precio:.4f} | {razon} | PnL: ${pnl:+.4f} | cap=${estado['capital']:.2f}")
-    _registrar_trade("EARLY_EXIT", exit_precio, None, "WIN" if pnl >= 0 else "LOSS", pnl)
-    resetear_pos()
-    guardar_estado(up_m, dn_m)
-
-
-# ─── RESOLUCIÓN ───────────────────────────────────────────────────────────────
-
-def verificar_resolucion(up_m, dn_m, secs):
-    if not pos["activa"]:
-        return
-
-    up_mid = mid(up_m)
-    dn_mid = mid(dn_m)
-
-    resuelto = None
-    if up_mid >= RESOLVED_UP_THRESH:
-        resuelto = "UP"
-    elif up_mid <= RESOLVED_DN_THRESH:
-        resuelto = "DOWN"
-    elif dn_mid >= RESOLVED_UP_THRESH:
-        resuelto = "DOWN"
-    elif secs is not None and secs <= 0:
-        resuelto = "UP" if up_mid > 0.5 else "DOWN"
-        log_ev(f"Tiempo agotado — resolviendo por mid UP={up_mid:.3f} -> {resuelto}")
-
-    if resuelto:
-        _aplicar_resolucion(resuelto, up_m, dn_m)
-
-
-def _aplicar_resolucion(resuelto: str, up_m, dn_m):
-    """
-    Vende el lado ganador al bid actual (cerca de 1.0).
-    El lado perdedor vale 0 — no se vende, se pierde el capital invertido.
-    """
-    pnl_total = 0.0
-    partes    = []
-
-    # ── Lado 1 ────────────────────────────────────────────────────────────
-    if resuelto == pos["lado1_side"]:
-        m_win = up_m if pos["lado1_side"] == "UP" else dn_m
-        if SIM_MODE:
-            _, pnl_sim_l1, ok1 = forzar_salida_sim(
-                pos["lado1_shares"], pos["lado1_usd"], m_win, f"resolucion {resuelto}",
-            )
-        else:
-            _, _, ok1 = forzar_salida(
-                pos["lado1_shares"], pos["lado1_usd"], m_win,
-                pos["lado1_token_id"], f"resolucion {resuelto}"
-            )
-        if not ok1:
-            pos["salida_pendiente"]  = True
-            pos["salida_tipo"]       = "RESOLUTION"
-            pos["salida_resolucion"] = resuelto
-            pos["salida_retries"]    = pos.get("salida_retries", 0) + 1
-            log_ev(f"RESOLUTION venta pendiente (intento #{pos['salida_retries']}) — reintentando en {POLL_INTERVAL}s")
-            return
-        # PnL a $1.00 (resolución) — independiente del precio de venta ejecutado
-        pnl_l1 = round(pos["lado1_shares"] * 1.0 - pos["lado1_usd"], 4)
-        partes.append(f"L1 {pos['lado1_side']}=WIN(${pnl_l1:+.2f})")
-    else:
-        pnl_l1 = -pos["lado1_usd"]
-        partes.append(f"L1 {pos['lado1_side']}=LOSS(${pnl_l1:+.2f})")
-    pnl_total += pnl_l1
-
-    # ── Lado 2 (hedge) ────────────────────────────────────────────────────
-    if pos["hedgeado"]:
-        if resuelto == pos["lado2_side"]:
-            m_win = dn_m if pos["lado2_side"] == "DOWN" else up_m
-            if SIM_MODE:
-                _, pnl_sim_l2, ok2 = forzar_salida_sim(
-                    pos["lado2_shares"], pos["lado2_usd"], m_win, f"resolucion hedge {resuelto}",
-                )
+        log.warning(f"No se pudo restaurar estado desde CSV: {e}")
+
+
+# ═══════════════════════════════════════════════════════
+#  DISCOVERY Y FETCH
+# ═══════════════════════════════════════════════════════
+
+async def discover_all():
+    loop = asyncio.get_event_loop()
+    for sym in SYMBOLS:
+        try:
+            info = await loop.run_in_executor(None, find_active_market, sym)
+            if info:
+                markets[sym]["info"]  = info
+                markets[sym]["error"] = None
+                mid_history[sym].clear()
+                log_event(f"{sym}: mercado encontrado — {info.get('question','')[:50]}")
             else:
-                _, _, ok2 = forzar_salida(
-                    pos["lado2_shares"], pos["lado2_usd"], m_win,
-                    pos["lado2_token_id"], f"resolucion hedge {resuelto}"
-                )
-            if not ok2:
-                pos["salida_pendiente"]  = True
-                pos["salida_tipo"]       = "RESOLUTION"
-                pos["salida_resolucion"] = resuelto
-                pos["salida_retries"]    = pos.get("salida_retries", 0) + 1
-                log_ev(f"RESOLUTION hedge venta pendiente (intento #{pos['salida_retries']}) — reintentando en {POLL_INTERVAL}s")
-                return
-            # PnL a $1.00 (resolución) — independiente del precio de venta ejecutado
-            pnl_l2 = round(pos["lado2_shares"] * 1.0 - pos["lado2_usd"], 4)
-            partes.append(f"L2 {pos['lado2_side']}=WIN(${pnl_l2:+.2f})")
+                markets[sym]["info"]  = None
+                markets[sym]["error"] = "sin mercado activo"
+                log_event(f"{sym}: no se encontró mercado activo")
+        except Exception as e:
+            markets[sym]["info"]  = None
+            markets[sym]["error"] = str(e)
+            log_event(f"{sym}: error en discovery — {e}")
+    bt["traded_this_cycle"] = False
+    write_state()
+
+
+async def fetch_one(sym: str):
+    info = markets[sym]["info"]
+    if not info:
+        return
+    loop = asyncio.get_event_loop()
+    try:
+        up_metrics, err_up = await loop.run_in_executor(
+            None, get_order_book_metrics, info["up_token_id"]
+        )
+        dn_metrics, err_dn = await loop.run_in_executor(
+            None, get_order_book_metrics, info["down_token_id"]
+        )
+
+        if up_metrics and dn_metrics:
+            markets[sym]["up_bid"] = up_metrics["best_bid"]
+            markets[sym]["up_ask"] = up_metrics["best_ask"]
+            markets[sym]["dn_bid"] = dn_metrics["best_bid"]
+            markets[sym]["dn_ask"] = dn_metrics["best_ask"]
+
+            def calc_mid(bid, ask):
+                if bid > 0 and ask > 0:
+                    return round((bid + ask) / 2, 4)
+                elif bid > 0:
+                    return round(bid, 4)
+                elif ask > 0:
+                    return round(ask, 4)
+                return 0.0
+
+            up_mid = calc_mid(up_metrics["best_bid"], up_metrics["best_ask"])
+            markets[sym]["up_mid"] = up_mid
+            markets[sym]["dn_mid"] = calc_mid(dn_metrics["best_bid"], dn_metrics["best_ask"])
+
+            if up_mid > 0:
+                mid_history[sym].append(up_mid)
+
+            secs = seconds_remaining(info)
+            if secs is not None:
+                markets[sym]["time_left"] = f"{int(secs)}s"
+                if secs <= 0:
+                    markets[sym]["info"] = None
+            else:
+                markets[sym]["time_left"] = "N/A"
+            markets[sym]["error"] = None
         else:
-            pnl_l2 = -pos["lado2_usd"]
-            partes.append(f"L2 {pos['lado2_side']}=LOSS(${pnl_l2:+.2f})")
-        pnl_total += pnl_l2
-
-    estado["capital"]   += pos["capital_usado"] + pnl_total
-    estado["pnl_total"] += pnl_total
-
-    outcome = "WIN" if pnl_total >= 0 else "LOSS"
-    if outcome == "WIN":
-        estado["wins"] += 1
-    else:
-        estado["losses"] += 1
-
-    actualizar_drawdown()
-    log_ev(
-        f"RESOLUCION -> {resuelto} | {' | '.join(partes)} | "
-        f"PnL NETO: ${pnl_total:+.2f} | cap=${estado['capital']:.2f}"
-    )
-    _registrar_trade("RESOLUTION", 1.0 if resuelto == pos["lado1_side"] else 0.0,
-                     resuelto, outcome, pnl_total)
-    resetear_pos()
-    guardar_estado(up_m, dn_m)
+            markets[sym]["error"] = err_up or err_dn or "error ob"
+    except Exception as e:
+        markets[sym]["error"] = str(e)
 
 
-def _registrar_trade(tipo, exit_precio, resuelto, outcome, pnl):
-    estado["trades"].append({
-        "ts":           datetime.now().isoformat(),
-        "tipo":         tipo,
-        "resolucion":   resuelto,
-        "lado1_side":   pos["lado1_side"],
-        "lado1_usd":    round(pos["lado1_usd"], 4),
-        "lado1_precio": round(pos["lado1_precio"], 4),
-        "hedgeado":     pos["hedgeado"],
-        "lado2_side":   pos["lado2_side"],
-        "lado2_usd":    round(pos["lado2_usd"], 4),
-        "lado2_precio": round(pos["lado2_precio"], 4),
-        "exit_precio":  round(exit_precio, 4),
-        "pnl":          round(pnl, 4),
-        "capital":      round(estado["capital"], 4),
-        "outcome":      outcome,
-    })
+async def fetch_all():
+    await asyncio.gather(*[fetch_one(sym) for sym in SYMBOLS])
 
 
-# ─── REINTENTOS DE VENTA PENDIENTE ───────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
+#  SEÑALES Y LÓGICA DE TRADING
+# ═══════════════════════════════════════════════════════
 
-def reintentar_salida_pendiente(up_m, dn_m):
-    """
-    Reintenta ventas que fallaron en el ciclo anterior.
-    Se llama al inicio de cada iteración del loop principal.
-    Patrón idéntico al check_stop_loss de Gold-HARM-ENTRY.
-    """
-    if not pos["activa"] or not pos["salida_pendiente"]:
+def compute_signals():
+    def normalized_up(s):
+        mid = markets[s]["up_mid"]
+        if mid >= RESOLVED_UP_THRESH:
+            return 1.0
+        if mid <= RESOLVED_DN_THRESH:
+            return 0.0
+        return mid
+
+    def normalized_dn(s):
+        mid = markets[s]["dn_mid"]
+        if mid >= RESOLVED_UP_THRESH:
+            return 1.0
+        if mid <= RESOLVED_DN_THRESH:
+            return 0.0
+        return mid
+
+    up_mids = {s: normalized_up(s) for s in SYMBOLS if markets[s]["up_mid"] > 0}
+    dn_mids = {s: normalized_dn(s) for s in SYMBOLS if markets[s]["dn_mid"] > 0}
+
+    if len(up_mids) < 2:
+        bt["signal_asset"] = None
         return
 
-    pos["salida_retries"] += 1
-    log_ev(f"Reintentando venta pendiente (intento #{pos['salida_retries']}) tipo={pos['salida_tipo']}...")
+    harm_up = harmonic_mean(list(up_mids.values()))
+    harm_dn = harmonic_mean(list(dn_mids.values()))
+    bt["harm_up"] = harm_up
+    bt["harm_dn"] = harm_dn
 
-    tipo = pos["salida_tipo"]
+    cheapest_up, div_up = find_cheapest(up_mids, harm_up)
+    cheapest_dn, div_dn = find_cheapest(dn_mids, harm_dn)
 
-    if tipo == "EARLY_EXIT":
-        lado1    = pos["lado1_side"]
-        token_id = pos["lado1_token_id"]
-        m_lado1  = up_m if lado1 == "UP" else dn_m
-        razon    = pos["salida_razon"] or "reintento early exit"
+    if abs(div_up) >= abs(div_dn) and cheapest_up:
+        bt["signal_asset"] = cheapest_up
+        bt["signal_side"]  = "UP"
+        bt["signal_div"]   = div_up
+    elif cheapest_dn:
+        bt["signal_asset"] = cheapest_dn
+        bt["signal_side"]  = "DOWN"
+        bt["signal_div"]   = div_dn
+    else:
+        bt["signal_asset"] = None
 
-        exit_precio, pnl, ok = forzar_salida(
-            pos["lado1_shares"], pos["lado1_usd"], m_lado1, token_id, razon
-        )
-        if not ok:
-            return  # sigue pendiente, se reintentará en el próximo ciclo
+    if bt["signal_asset"] and bt["signal_side"]:
+        peers = [s for s in SYMBOLS if s != bt["signal_asset"]]
+        if bt["signal_side"] == "UP":
+            peer_vals = [markets[p]["up_mid"] for p in peers if markets[p]["up_mid"] > 0]
+        else:
+            peer_vals = [markets[p]["dn_mid"] for p in peers if markets[p]["dn_mid"] > 0]
 
-        pos["salida_pendiente"] = False
-        estado["capital"]   += pos["lado1_usd"] + pnl
-        estado["pnl_total"] += pnl
-        if pnl >= 0: estado["wins"] += 1
-        else:        estado["losses"] += 1
-        actualizar_drawdown()
-        log_ev(f"EARLY EXIT (reintento OK) {lado1} @ {exit_precio:.4f} | PnL: ${pnl:+.4f} | cap=${estado['capital']:.2f}")
-        _registrar_trade("EARLY_EXIT", exit_precio, None, "WIN" if pnl >= 0 else "LOSS", pnl)
-        resetear_pos()
-        guardar_estado(up_m, dn_m)
-
-    elif tipo == "RESOLUTION":
-        resuelto = pos["salida_resolucion"]
-        _aplicar_resolucion(resuelto, up_m, dn_m)
-
-
-# ─── CONTROL DEL BOT ──────────────────────────────────────────────────────────
-
-def activar_bot():
-    global PAUSED
-    PAUSED = False
-    log_ev("Bot ACTIVADO")
-    guardar_estado()
+        if len(peer_vals) == 2 and all(v > CONSENSUS_FULL for v in peer_vals):
+            bt["consensus"] = "FULL"
+        elif len(peer_vals) >= 1 and sum(1 for v in peer_vals if v > CONSENSUS_SOFT) >= 1:
+            bt["consensus"] = "SOFT"
+        else:
+            bt["consensus"] = "NONE"
 
 
-def pausar_bot():
-    global PAUSED
-    PAUSED = True
-    log_ev("Bot PAUSADO")
-    guardar_estado()
+def check_entry():
+    if bt["traded_this_cycle"]:
+        return
+    if not bt["entry_window"]:
+        return
+
+    # ← CAMBIO: acepta SOFT además de FULL
+    if bt["consensus"] not in ("FULL", "SOFT"):
+        bt["skipped"] += 1
+        return
+
+    if not bt["signal_asset"]:
+        return
+
+    div_abs = abs(bt["signal_div"])
+    if div_abs < DIVERGENCE_THRESHOLD:
+        return
+    # Sin DIVERGENCE_MAX — cualquier gap >= threshold es válido
+
+    sym  = bt["signal_asset"]
+    side = bt["signal_side"]
+
+    if side == "UP":
+        entry_ask = markets[sym]["up_ask"]
+        entry_bid = markets[sym]["up_bid"]
+        entry_mid = markets[sym]["up_mid"]
+    else:
+        entry_ask = markets[sym]["dn_ask"]
+        entry_bid = markets[sym]["dn_bid"]
+        entry_mid = markets[sym]["dn_mid"]
+
+    if entry_ask <= 0 or entry_ask >= 1:
+        return
+
+    up_mid = markets[sym]["up_mid"]
+    dn_mid = markets[sym]["dn_mid"]
+    if up_mid >= RESOLVED_UP_THRESH or up_mid <= RESOLVED_DN_THRESH or \
+       dn_mid >= RESOLVED_UP_THRESH or dn_mid <= RESOLVED_DN_THRESH:
+        log_event(f"SKIP {side} {sym} — activo ya resuelto (up={up_mid:.4f} dn={dn_mid:.4f})")
+        bt["skipped"] += 1
+        return
+
+    if entry_ask < ENTRY_MIN_PRICE:
+        log_event(f"SKIP {side} {sym} — ask={entry_ask:.4f} bajo mínimo {ENTRY_MIN_PRICE}")
+        bt["skipped"] += 1
+        return
+
+    shares = round(ENTRY_USD / entry_ask, 6)
+    secs   = min_secs_remaining() or 0
+
+    peers          = [s for s in SYMBOLS if s != sym]
+    peer_snaps     = {p: {"up_mid": markets[p]["up_mid"], "dn_mid": markets[p]["dn_mid"]} for p in peers}
+    harm_entry     = bt["harm_up"] if side == "UP" else bt["harm_dn"]
+    gap_entry      = bt["signal_div"]
+    capital_before = bt["capital"]
+
+    bt["capital"] -= ENTRY_USD
+    bt["traded_this_cycle"] = True
+
+    bt["position"] = {
+        "asset":         sym,
+        "side":          side,
+        "entry_price":   entry_ask,
+        "entry_bid":     entry_bid,
+        "entry_mid":     entry_mid,
+        "entry_usd":     ENTRY_USD,
+        "shares":        shares,
+        "secs_left_entry": secs,
+        "harm_entry":    harm_entry,
+        "gap_entry":     gap_entry,
+        "entry_ts":      datetime.now().isoformat(),
+        "consensus_entry": bt["consensus"],
+        "peer_snaps":    peer_snaps,
+        "capital_before": capital_before,
+        "market_info_snapshot": {
+            "condition_id": markets[sym]["info"].get("condition_id") if markets[sym]["info"] else None,
+        },
+    }
+
+    log_event(
+        f"ENTRADA {side} {sym} @ ask={entry_ask:.4f} | "
+        f"div={gap_entry*100:+.1f}pts | arm={harm_entry:.4f} | "
+        f"consensus={bt['consensus']} | shares={shares:.4f} | capital=${bt['capital']:.2f}"
+    )
+    write_state()
 
 
-def activar_sim():
-    global PAUSED, SIM_MODE
-    SIM_MODE = True
-    PAUSED   = False
-    log_ev("Bot SIMULACION ACTIVADO")
-    guardar_estado()
+def check_stop_loss():
+    pos  = bt["position"]
+    if not pos:
+        return
+    sym  = pos["asset"]
+    side = pos["side"]
+    current_bid = markets[sym]["up_bid"] if side == "UP" else markets[sym]["dn_bid"]
+    if current_bid <= STOP_LOSS_PRICE and current_bid > 0:
+        pnl = round(pos["shares"] * current_bid - ENTRY_USD, 6)
+        bt["capital"]   += ENTRY_USD + pnl
+        bt["total_pnl"] += pnl
+        bt["losses"]    += 1
+        update_drawdown()
+        log_event(f"STOP LOSS {side} {sym} @ bid={current_bid:.4f} | PnL=${pnl:+.4f}")
+        _record_trade_sl(pos, current_bid, pnl)
+        bt["position"] = None
+        write_state()
 
 
-def pausar_sim():
-    global PAUSED, SIM_MODE
-    SIM_MODE = False
-    PAUSED   = True
-    log_ev("Bot SIMULACION PAUSADO")
-    guardar_estado()
+def _apply_resolution(pos, resolved):
+    sym  = pos["asset"]
+    side = pos["side"]
+    if resolved == side:
+        pnl     = round((pos["shares"] - 1) * ENTRY_USD, 6)
+        outcome = "WIN"
+        bt["wins"] += 1
+    else:
+        pnl     = -ENTRY_USD
+        outcome = "LOSS"
+        bt["losses"] += 1
+    bt["capital"]   += ENTRY_USD + pnl
+    bt["total_pnl"] += pnl
+    update_drawdown()
+    log_event(
+        f"RESOLUCIÓN {outcome} {side} {sym} → {resolved} | "
+        f"PnL=${pnl:+.4f} | Capital=${bt['capital']:.4f}"
+    )
+    _record_trade(pos, resolved, outcome, pnl)
+    write_state()
 
 
-# ─── LOOP PRINCIPAL ───────────────────────────────────────────────────────────
+def check_resolution():
+    pos = bt["position"]
+    if not pos:
+        return
+
+    sym    = pos["asset"]
+    up_mid = markets[sym]["up_mid"]
+
+    resolved = None
+    if up_mid >= RESOLVED_UP_THRESH:
+        resolved = "UP"
+    elif up_mid <= RESOLVED_DN_THRESH:
+        resolved = "DOWN"
+
+    if resolved:
+        _apply_resolution(pos, resolved)
+        bt["position"] = None
+        return
+
+    if markets[sym]["info"] is None:
+        resolved = resolve_from_clob_history(sym)
+
+        if resolved == "_UNKNOWN":
+            log_event(f"FALLBACK {sym}: resolución imposible — LOSS conservador")
+            pnl = -ENTRY_USD
+            bt["capital"]   += ENTRY_USD + pnl
+            bt["total_pnl"] += pnl
+            bt["losses"]    += 1
+            update_drawdown()
+            _record_trade(pos, "UNKNOWN", "LOSS", pnl)
+        else:
+            _apply_resolution(pos, resolved)
+
+        bt["position"] = None
+        write_state()
+
+
+# ═══════════════════════════════════════════════════════
+#  PERSISTENCIA
+# ═══════════════════════════════════════════════════════
+
+def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
+    exit_ts    = datetime.now().isoformat()
+    duration_s = round((datetime.fromisoformat(exit_ts) - datetime.fromisoformat(pos["entry_ts"])).total_seconds(), 1)
+    trade_number = bt["wins"] + bt["losses"]
+
+    peers      = [s for s in SYMBOLS if s != pos["asset"]]
+    peer_snaps = pos.get("peer_snaps", {})
+
+    def peer_mids(p):
+        snap = peer_snaps.get(p, {})
+        side = pos["side"]
+        if side == "UP":
+            return snap.get("up_mid", 0.0), snap.get("dn_mid", 0.0)
+        else:
+            return snap.get("dn_mid", 0.0), snap.get("up_mid", 0.0)
+
+    p1_side_mid, p1_opp_mid = peer_mids(peers[0]) if len(peers) > 0 else (0.0, 0.0)
+    p2_side_mid, p2_opp_mid = peer_mids(peers[1]) if len(peers) > 1 else (0.0, 0.0)
+
+    sl_price = STOP_LOSS_PRICE
+    max_win  = round((1.0 - pos["entry_price"]) / pos["entry_price"] * pos["entry_usd"], 6)
+
+    binary_win = 1 if outcome == "WIN" and exit_type == "RESOLUTION" else \
+                 0 if outcome == "LOSS" and exit_type == "RESOLUTION" else -1
+
+    return {
+        "trade_id":         f"T{trade_number:04d}",
+        "entry_ts":         pos["entry_ts"],
+        "exit_ts":          exit_ts,
+        "duration_s":       duration_s,
+        "asset":            pos["asset"],
+        "side":             pos["side"],
+        "consensus":        pos["consensus_entry"],
+        "entry_ask":        round(pos["entry_price"], 6),
+        "entry_bid":        round(pos["entry_bid"], 6),
+        "entry_mid":        round(pos["entry_mid"], 6),
+        "entry_usd":        round(pos["entry_usd"], 4),
+        "shares":           round(pos["shares"], 6),
+        "secs_left_entry":  round(pos["secs_left_entry"], 1),
+        "harm_entry":       round(pos["harm_entry"], 6),
+        "gap_pts":          round(pos["gap_entry"] * 100, 2),
+        "peer1_sym":        peers[0] if len(peers) > 0 else "",
+        "peer1_side_mid":   round(p1_side_mid, 6),
+        "peer1_opp_mid":    round(p1_opp_mid, 6),
+        "peer2_sym":        peers[1] if len(peers) > 1 else "",
+        "peer2_side_mid":   round(p2_side_mid, 6),
+        "peer2_opp_mid":    round(p2_opp_mid, 6),
+        "sl_price":         sl_price,
+        "exit_type":        exit_type,
+        "exit_price":       round(exit_price, 6),
+        "resolved":         resolved or "",
+        "binary_win":       binary_win,
+        "pnl_usd":          round(pnl, 6),
+        "pnl_pct_entry":    round(pnl / pos["entry_usd"] * 100, 2),
+        "max_possible_win": max_win,
+        "outcome":          outcome,
+        "capital_before":   round(pos["capital_before"], 4),
+        "capital_after":    round(bt["capital"], 4),
+        "cumulative_pnl":   round(bt["total_pnl"], 6),
+        "trade_number":     trade_number,
+    }
+
+
+def _save_csv(record: dict):
+    file_exists = os.path.isfile(CSV_FILE)
+    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(record)
+
+
+def _record_trade(pos, resolved, outcome, pnl):
+    exit_price = 1.0 if resolved == pos["side"] else 0.0
+    record = _build_trade_record(pos, "RESOLUTION", exit_price, resolved, outcome, pnl)
+    bt["trades"].append(record)
+    _save_csv(record)
+    _save_log()
+
+
+def _record_trade_sl(pos, exit_bid, pnl):
+    record = _build_trade_record(pos, "STOP_LOSS", exit_bid, None, "LOSS", pnl)
+    bt["trades"].append(record)
+    _save_csv(record)
+    _save_log()
+
+
+def _save_log():
+    total = bt["wins"] + bt["losses"]
+    with open(LOG_FILE, "w") as f:
+        json.dump({
+            "summary": {
+                "capital_inicial":           CAPITAL_TOTAL,
+                "capital_actual":            round(bt["capital"], 4),
+                "total_pnl_usd":             round(bt["total_pnl"], 4),
+                "roi_pct":                   round((bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100, 2),
+                "max_drawdown":              round(bt["max_drawdown"], 4),
+                "wins":                      bt["wins"],
+                "losses":                    bt["losses"],
+                "win_rate":                  round(bt["wins"] / total * 100, 1) if total else 0,
+                "skipped":                   bt["skipped"],
+                "entry_usd":                 ENTRY_USD,
+                "consensus_soft_threshold":  CONSENSUS_SOFT,
+            },
+            "trades": bt["trades"],
+        }, f, indent=2)
+
+
+# ═══════════════════════════════════════════════════════
+#  LOOP PRINCIPAL
+# ═══════════════════════════════════════════════════════
 
 async def main_loop():
-    global _ob_error_count
+    log_event("basket_soft.py iniciado — DIVERGENCIA ARMÓNICA [SOFT]")
+    log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
+    log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} (sin máximo) | Consenso SOFT>={CONSENSUS_SOFT} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s")
 
-    log_ev("=" * 65)
-    log_ev("  HEDGE PROD — BTC Up/Down 5m  *** PRODUCCION REAL ***")
-    log_ev(f"  Fijo: ${MONTO_FIJO_POR_LADO:.2f}/lado")
-    log_ev(f"  Entrada: [{PRECIO_MIN_LADO1:.2f}-{PRECIO_MAX_LADO1:.2f}]")
-    log_ev(f"  Hedge: [{HEDGE_PRECIO_MIN:.2f}-{HEDGE_PRECIO_MAX:.2f}] | move_min={HEDGE_MOVE_MIN:.2f}")
-    log_ev(f"  MIN_HOLD={MIN_HOLD_SECS}s  NEAR_THRESH={NEAR_RESOLUTION_THRESH}@{NEAR_RESOLUTION_SECS}s")
-    log_ev(f"  Bot arranca PAUSADO — usa /api/start para activar")
-    log_ev("=" * 65)
+    restore_state_from_csv()
 
-    restaurar_estado()
-    sincronizar_capital_clob()
-    guardar_estado()
-
-    mkt                = None
-    loop               = asyncio.get_running_loop()
-    signal_up_cache    = None
-    signal_dn_cache    = None
-    ya_opero_ciclo     = False
-    saltar_primer_mkt  = True
+    bt["phase"] = "ACTIVO"
+    write_state()
+    await discover_all()
 
     while True:
         try:
-            if PAUSED:
-                guardar_estado()
-                await asyncio.sleep(POLL_INTERVAL * 2)
+            secs = min_secs_remaining()
+
+            if secs is not None and secs > WAKE_UP_SECS and not bt["position"]:
+                sleep_duration = secs - WAKE_UP_SECS
+                wake_at = datetime.fromtimestamp(time.time() + sleep_duration).strftime("%H:%M:%S")
+                bt["phase"]        = "DURMIENDO"
+                bt["entry_window"] = False
+
+                slept = 0
+                while slept < sleep_duration:
+                    chunk = min(5.0, sleep_duration - slept)
+                    await asyncio.sleep(chunk)
+                    slept += chunk
+                    bt["next_wake"] = f"{wake_at} (en {int(max(0, sleep_duration - slept))}s)"
+                    write_state()
+
+                bt["phase"] = "ACTIVO"
+                log_event(f"Despertando — faltan ~{WAKE_UP_SECS}s")
+                await discover_all()
                 continue
 
-            if mkt is None:
-                log_ev("Buscando mercado BTC Up/Down 5m...")
-                guardar_estado()
-                obi_history_up.clear()
-                obi_history_dn.clear()
-                ya_opero_ciclo = False
-                mkt = await loop.run_in_executor(None, find_active_market, "BTC")
-                if mkt:
-                    if saltar_primer_mkt:
-                        log_ev(f"Mercado encontrado (saltado): {mkt.get('question', '')} — siguiente ciclo será el primero")
-                        saltar_primer_mkt = False
-                        mkt = None
-                        await asyncio.sleep(POLL_INTERVAL)
-                        continue
-                    estado["ciclos"] += 1
-                    mkt_end_date = mkt.get("end_date")
-                    log_ev(f"Mercado: {mkt.get('question', '')}")
-                    # Pre-calentar cache CLOB para ambos tokens — reduce delay de balance al vender
-                    approve_conditional_token(mkt["up_token_id"])
-                    approve_conditional_token(mkt["down_token_id"])
-                    log_ev("  Cache CLOB pre-aprobado (UP + DOWN)")
-                    guardar_estado()
-                else:
-                    log_ev("Sin mercado activo — reintentando en 10s...")
-                    guardar_estado()
-                    await asyncio.sleep(10)
-                    continue
+            bt["phase"] = "ACTIVO"
+            bt["cycle"] += 1
 
-            up_m, err_up = await loop.run_in_executor(
-                None, get_order_book_metrics, mkt["up_token_id"]
-            )
-            dn_m, err_dn = await loop.run_in_executor(
-                None, get_order_book_metrics, mkt["down_token_id"]
+            await fetch_all()
+
+            secs = min_secs_remaining()
+            bt["entry_window"] = (
+                secs is not None and
+                secs <= ENTRY_WINDOW_SECS and
+                secs >= ENTRY_OPEN_SECS
+                and secs > ENTRY_CLOSE_SECS
             )
 
-            if not up_m or not dn_m:
-                _ob_error_count += 1
-                backoff = min(POLL_INTERVAL * (2 ** _ob_error_count), 60)
-                log_ev(f"Error OB #{_ob_error_count}: {err_up or err_dn} — backoff {backoff:.0f}s")
-                await asyncio.sleep(backoff)
+            if bt["position"]:
+                check_stop_loss()
+            if bt["position"]:
+                check_resolution()
+
+            if all(markets[s]["info"] is None for s in SYMBOLS):
+                if bt["position"]:
+                    log_event("Mercado expirado con posicion abierta — resolviendo con historial CLOB...")
+                    check_resolution()
+                if not bt["position"]:
+                    log_event("Ciclo expirado — buscando nuevo ciclo...")
+                    await discover_all()
                 continue
 
-            _ob_error_count = 0
+            if not bt["position"]:
+                compute_signals()
+                check_entry()
 
-            secs = seconds_remaining(mkt)
-
-            if secs is not None and secs <= 0:
-                if pos["activa"]:
-                    verificar_resolucion(up_m, dn_m, secs)
-                log_ev("Mercado expirado — buscando próximo ciclo...")
-                mkt = None
-                mkt_end_date = None
-                await asyncio.sleep(5)
-                continue
-
-            # ── Reintentar ventas pendientes del ciclo anterior ───────────
-            reintentar_salida_pendiente(up_m, dn_m)
-
-            if pos["activa"] and not pos["salida_pendiente"]:
-                verificar_resolucion(up_m, dn_m, secs)
-
-            if pos["activa"] and not pos["hedgeado"] and not pos["salida_pendiente"]:
-                intentar_early_exit(up_m, dn_m, secs)
-
-            if pos["activa"] and not pos["hedgeado"] and not pos["salida_pendiente"]:
-                intentar_hedge(up_m, dn_m, mkt)
-
-            if not pos["activa"] and not ya_opero_ciclo:
-                if intentar_entrada(up_m, dn_m, mkt, secs):
-                    ya_opero_ciclo = True
-
-            signal_up_cache = compute_signal(up_m["obi"], list(obi_history_up), OBI_THRESHOLD)
-            signal_dn_cache = compute_signal(dn_m["obi"], list(obi_history_dn), OBI_THRESHOLD)
-
-            guardar_estado(up_m, dn_m)
-            imprimir_estado(up_m, dn_m, secs, signal_up_cache, signal_dn_cache)
+            write_state()
 
         except Exception as e:
-            log_ev(f"Error en loop: {e}")
-            import traceback
-            traceback.print_exc()
+            log_event(f"Error en loop: {e}")
+            write_state()
 
         await asyncio.sleep(POLL_INTERVAL)
 
 
-# ─── SERVIDOR HTTP ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
+#  DASHBOARD EN HILO SECUNDARIO
+# ═══════════════════════════════════════════════════════
+
+def run_dashboard():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dashboard", "dashboard.py")
+    dash = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dash)
+    port = int(os.environ.get("PORT", 5000))
+    log.info(f"Dashboard iniciando en puerto {port}")
+    dash.app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
+# ═══════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import threading
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    import csv as csv_module
-    import io
+    log.info("=" * 54)
+    log.info("  BASKET SOFT — DIVERGENCIA ARMONICA  [SOFT]")
+    log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
+    log.info(f"  Gap: >={DIVERGENCE_THRESHOLD*100:.0f}pts (sin máximo)  |  Consenso SOFT>={CONSENSUS_SOFT}")
+    log.info(f"  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s  |  SL: {STOP_LOSS_PRICE}")
+    log.info("  SIMULACION — SIN DINERO REAL")
+    log.info("=" * 54)
+    log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
 
-    PORT           = int(os.environ.get("PORT", 8080))
-    DASHBOARD_FILE = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):
-            pass
-
-        def do_GET(self):
-            try:
-                if self.path in ("/", "/index.html"):
-                    self._serve_dashboard()
-                elif self.path == "/api/status":
-                    self._serve_status()
-                elif self.path == "/api/trades":
-                    self._serve_trades()
-                elif self.path == "/api/csv":
-                    self._serve_csv()
-                elif self.path == "/api/events":
-                    self._serve_events()
-                else:
-                    self._send(404, "text/plain", b"Not found")
-            except Exception as e:
-                self._send(500, "text/plain", str(e).encode())
-
-        def do_POST(self):
-            if self.path == "/api/start":
-                activar_bot()
-                self._send(200, "application/json", b'{"ok":true,"msg":"Bot activado"}')
-            elif self.path == "/api/stop":
-                pausar_bot()
-                self._send(200, "application/json", b'{"ok":true,"msg":"Bot pausado"}')
-            elif self.path == "/api/reset":
-                resetear_pos()
-                log_ev("Posicion reseteada manualmente via /api/reset")
-                guardar_estado()
-                self._send(200, "application/json", b'{"ok":true,"msg":"Posicion reseteada"}')
-            elif self.path == "/api/start_sim":
-                activar_sim()
-                self._send(200, "application/json", b'{"ok":true,"msg":"Simulacion activada"}')
-            elif self.path == "/api/stop_sim":
-                pausar_sim()
-                self._send(200, "application/json", b'{"ok":true,"msg":"Simulacion pausada"}')
-            else:
-                self._send(404, "text/plain", b"Not found")
-
-        def _serve_dashboard(self):
-            if os.path.isfile(DASHBOARD_FILE):
-                with open(DASHBOARD_FILE, "rb") as f:
-                    body = f.read()
-                self._send(200, "text/html; charset=utf-8", body)
-            else:
-                try:
-                    if os.path.isfile(STATE_FILE):
-                        with open(STATE_FILE) as f:
-                            st = json.load(f)
-                    else:
-                        st = {}
-                    body = (
-                        f"<html><body><pre>HEDGE PROD — PRODUCCION REAL\n"
-                        f"Capital: ${st.get('capital', CAPITAL_INICIAL):.2f}\n"
-                        f"PnL: ${st.get('pnl_total', 0):.2f}\n"
-                        f"Paused: {st.get('paused', True)}\n"
-                        f"W:{st.get('wins',0)} L:{st.get('losses',0)}</pre></body></html>"
-                    ).encode()
-                except Exception:
-                    body = b"<html><body>HEDGE PROD - OK</body></html>"
-                self._send(200, "text/html; charset=utf-8", body)
-
-        def _serve_status(self):
-            try:
-                if os.path.isfile(STATE_FILE):
-                    with open(STATE_FILE) as f:
-                        data = json.load(f)
-                else:
-                    data = {
-                        "capital": CAPITAL_INICIAL, "capital_inicial": CAPITAL_INICIAL,
-                        "pnl_total": 0, "roi": 0, "win_rate": 0, "wins": 0, "losses": 0,
-                        "max_drawdown": 0, "ciclos": 0, "paused": PAUSED,
-                        "posicion": {"activa": False},
-                        "eventos": [], "trades": [], "ts": datetime.now().isoformat(),
-                    }
-                data["capital_inicial"] = data.get("capital_inicial", CAPITAL_INICIAL)
-                self._send(200, "application/json", json.dumps(data).encode())
-            except Exception as e:
-                self._send(500, "application/json", json.dumps({"error": str(e)}).encode())
-
-        def _serve_trades(self):
-            try:
-                trades = []
-                if os.path.isfile(LOG_FILE):
-                    with open(LOG_FILE) as f:
-                        trades = json.load(f).get("trades", [])
-                self._send(200, "application/json", json.dumps(trades).encode())
-            except Exception:
-                self._send(500, "application/json", b"[]")
-
-        def _serve_csv(self):
-            try:
-                trades = []
-                if os.path.isfile(LOG_FILE):
-                    with open(LOG_FILE) as f:
-                        trades = json.load(f).get("trades", [])
-                if not trades:
-                    self._send(200, "text/csv", b"sin trades")
-                    return
-                buf    = io.StringIO()
-                writer = csv_module.DictWriter(buf, fieldnames=trades[0].keys())
-                writer.writeheader()
-                writer.writerows(trades)
-                body = buf.getvalue().encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/csv")
-                self.send_header("Content-Disposition", "attachment; filename=trades.csv")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception as e:
-                self._send(500, "text/plain", str(e).encode())
-
-        def _serve_events(self):
-            try:
-                lines = []
-                if os.path.isfile(EVENTS_FILE):
-                    with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-                        lines = f.readlines()[-100:]
-                body = "".join(lines).encode("utf-8")
-                self._send(200, "text/plain; charset=utf-8", body)
-            except Exception as e:
-                self._send(500, "text/plain", str(e).encode())
-
-        def _send(self, code, ctype, body: bytes):
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    def run_http():
-        srv = HTTPServer(("0.0.0.0", PORT), Handler)
-        log.info(f"Dashboard en http://0.0.0.0:{PORT}")
-        srv.serve_forever()
-
-    threading.Thread(target=run_http, daemon=True).start()
+    t = threading.Thread(target=run_dashboard, daemon=True)
+    t.start()
 
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:
-        log.info("Bot detenido.")
+        log.info("Basket SOFT detenido.")
+        total = bt["wins"] + bt["losses"]
+        roi   = (bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100
+        log.info(f"Capital final: ${bt['capital']:.4f}  (ROI: {roi:+.2f}%)")
+        log.info(f"P&L total: ${bt['total_pnl']:+.4f}")
+        log.info(f"Trades: {total}  (WIN: {bt['wins']}  LOSS: {bt['losses']})")
